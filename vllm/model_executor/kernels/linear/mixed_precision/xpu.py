@@ -229,3 +229,82 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
         )
 
         return out.to(x.dtype)
+
+
+class XPUw8a16IntLinearKernel(MPLinearKernel):
+    """XPU kernel for W8A16 integer quantization using oneDNN int8_gemm_w8a16.
+
+    Weights are symmetric group-quantized int8 (s8), stored packed as int32
+    (4 int8 per i32, little-endian). Activations stay bf16/fp16 (W8A16).
+    """
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return -1
+
+    @classmethod
+    def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if not current_platform.is_xpu():
+            return False, "XPUw8a16Int only supported on XPU"
+        if c.act_type not in (torch.bfloat16, torch.float16):
+            return False, "XPUw8a16Int requires BF16/FP16 activations"
+        if c.weight_type != scalar_types.uint8b128:
+            return (
+                False,
+                f"XPUw8a16Int requires uint8b128 weights, got {c.weight_type}",
+            )
+        if c.zero_points:
+            return (
+                False,
+                "XPUw8a16Int only supports symmetric weight quantization",
+            )
+        if c.has_g_idx:
+            return False, "XPUw8a16Int does not support activation ordering"
+        if c.group_size != -1 and c.group_size % 32 != 0:
+            return (
+                False,
+                f"Group size ({c.group_size}) not supported by XPUw8a16Int, "
+                "must be a multiple of 32",
+            )
+        in_size, out_size = c.partition_weight_shape
+        if in_size % 32 != 0 or out_size % 32 != 0:
+            return (
+                False,
+                f"in/out sizes ({in_size}, {out_size}) must be multiples of 32",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # weight_packed is [N, K/4] int32 (4 int8 per i32, little-endian).
+        # The checkpoint uses the compressed-tensors uint8b128 convention: each
+        # byte stores (int8_value + 128), i.e. a +128 offset, NOT raw
+        # two's-complement int8. So view as uint8 and subtract 128 to recover the
+        # signed int8 values. (A plain .view(torch.int8) reinterpretation is
+        # wrong for any byte >= 128 and silently corrupts the weights.)
+        # Result is [N, K] with k contiguous; keep n-major so that
+        # weight_packed.t() in apply_weights yields [K, N] with k contiguous.
+        w_packed = layer.weight_packed.data  # [N, K/4] int32
+        w_u8 = w_packed.view(torch.uint8)  # [N, K] uint8, each = int8_value + 128
+        w_i8 = (w_u8.to(torch.int16) - 128).to(torch.int8)  # [N, K] int8
+        layer.weight_packed.data = w_i8
+
+        # weight_scale is [N, K/group_size] -> transpose to [K/group_size, N].
+        layer.weight_scale.data = layer.weight_scale.data.t().contiguous()
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        reshaped_x = x.reshape(-1, x.shape[-1])  # [M, K]
+        w_q = layer.weight_packed  # [N, K] int8
+        w_s = layer.weight_scale  # [K/group_size, N] bf16
+        out = torch.ops._xpu_C.int8_gemm_w8a16(
+            reshaped_x,
+            w_q.t(),  # [K, N] int8, k contiguous
+            bias,
+            w_s,
+            self.config.group_size,
+        )
+        return out

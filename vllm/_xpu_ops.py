@@ -113,6 +113,23 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
         return torch.empty((M, N), dtype=input.dtype, device=input.device)
 
 
+if hasattr(torch.ops._xpu_C, "int8_gemm_w8a16"):
+
+    @register_fake("_xpu_C::int8_gemm_w8a16")
+    def _int8_gemm_w8a16_fake(
+        input: torch.Tensor,
+        q_weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        weight_scale: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        # q_weight is [K, N] int8 (transposed [N, K] weight).
+        input_2d = input.view(-1, input.shape[-1])
+        M = input_2d.size(0)
+        N = q_weight.size(1)
+        return torch.empty((M, N), dtype=input.dtype, device=input.device)
+
+
 def _gdn_attention_core_xpu_impl(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -127,6 +144,20 @@ def _gdn_attention_core_xpu_impl(
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     attn_metadata_raw = forward_context.attn_metadata
+
+    import os as _os
+    _dbg_attn = _os.environ.get("QWEN4EXP_DEBUG_ATTN") == "1"
+    _show = False
+    if _dbg_attn:
+        import sys as _sys
+        _g = globals()
+        if attn_metadata_raw is None:
+            _g["_gdn_attn_none"] = _g.get("_gdn_attn_none", 0) + 1
+        else:
+            _rc = _g.get("_gdn_attn_real", 0)
+            _g["_gdn_attn_real"] = _rc + 1
+            _show = _rc < 40
+            print(f"GDN_ATTN_DBG prefix={self.prefix} real#{_rc} none_so_far={_g['_gdn_attn_none']}", file=_sys.stderr, flush=True)
 
     if attn_metadata_raw is None:
         return
@@ -143,6 +174,17 @@ def _gdn_attention_core_xpu_impl(
     num_spec_decodes = attn_metadata.num_spec_decodes
 
     has_initial_state = attn_metadata.has_initial_state
+
+    if _dbg_attn and _show:
+        import sys as _sys
+        _nsi = attn_metadata.non_spec_state_indices_tensor
+        print(
+            f"GDN_ATTN_DBG2 prefix={self.prefix} num_actual={num_actual_tokens} "
+            f"prefills={num_prefills} decodes={num_decodes} "
+            f"has_init={None if has_initial_state is None else has_initial_state.tolist()} "
+            f"nsi={None if _nsi is None else _nsi.tolist()}",
+            file=_sys.stderr, flush=True,
+        )
 
     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
     non_spec_token_indx = attn_metadata.non_spec_token_indx
@@ -199,6 +241,14 @@ def _gdn_attention_core_xpu_impl(
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
+
+    if _dbg_attn and _show:
+        import sys as _sys
+        print(
+            f"GDN_ATTN_DBG3 prefix={self.prefix} core_out_absmax={core_attn_out.float().abs().max().item():.6f} "
+            f"z_absmax={z.float().abs().max().item():.6f}",
+            file=_sys.stderr, flush=True,
+        )
 
 
 def _gdn_attention_core_xpu_fake(

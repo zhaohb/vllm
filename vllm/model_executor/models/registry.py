@@ -112,7 +112,7 @@ _TEXT_GENERATION_MODELS = {
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
     "Qwen4ExpForCausalLM": (
-        "vllm.models.qwen4_exp",
+        "qwen4_exp",
         "Qwen4ExpForCausalLM",
     ),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
@@ -578,7 +578,7 @@ _MULTIMODAL_MODELS = {
         "Qwen3_5MoeForConditionalGeneration",
     ),
     "Qwen4ExpForConditionalGeneration": (
-        "vllm.models.qwen4_exp",
+        "qwen4_exp",
         "Qwen4ExpForConditionalGeneration",
     ),
     "RForConditionalGeneration": ("rvl", "RForConditionalGeneration"),
@@ -667,7 +667,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "MedusaModel": ("medusa", "Medusa"),
     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
-    "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
+    "Qwen4ExpMTP": ("qwen4_exp_mtp", "Qwen4ExpMTP"),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
