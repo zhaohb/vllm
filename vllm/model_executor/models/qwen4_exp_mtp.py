@@ -90,6 +90,21 @@ class _GroupedRMSNormCollapse(nn.Module):
         xn = xn * gamma
         return xn.mean(dim=1)  # [T, n_embd]
 
+    def forward_wide(self, x: torch.Tensor) -> torch.Tensor:
+        """RMSNorm over the full ``hc * n_embd`` vector, keeping the wide state.
+
+        Equivalent to the amd/nvidia
+        ``pre_fc_norm_hidden(hidden.flatten(-2)).view(T, hc, H)``
+        (GemmaRMSNorm, gamma = 1 + w). Unlike :meth:`forward`, the hc
+        streams are NOT mean-collapsed.
+        """
+        t = x.shape[0]
+        flat = x.reshape(t, self.hc * self.n_embd)
+        var = flat.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        xn = flat * torch.rsqrt(var + self.eps).to(flat.dtype)
+        gamma = (1.0 + self.weight.float()).to(xn.dtype)
+        return (xn * gamma).view(t, self.hc, self.n_embd)
+
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -164,10 +179,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         wide_hidden: torch.Tensor,
     ) -> torch.Tensor:
         # inputs_embeds: [T, n_embd]; wide_hidden: [T, hc, n_embd]
-        e = self.pre_fc_norm_embedding(inputs_embeds)
-        h = self.pre_fc_norm_hidden(wide_hidden)
-        x = self.fc_embedding(e) + self.fc_hidden(h)
-        return x  # [T, n_embd]
+        # residual_linear_shared fusion (matches amd/nvidia): normalize over
+        # the full hc*n_embd vector, project each hc stream with the shared
+        # fc_hidden, then add the projected embedding as a residual to every
+        # stream. The hc streams stay DISTINCT -- mean-collapsing them here
+        # discards the inter-stream information that hyper-connections exist
+        # to carry, and measurably lowers MTP acceptance.
+        e = self.fc_embedding(self.pre_fc_norm_embedding(inputs_embeds))
+        h = self.pre_fc_norm_hidden.forward_wide(wide_hidden)
+        h = self.fc_hidden(h)
+        return e.unsqueeze(-2) + h  # [T, hc, n_embd]
 
     def forward(
         self,
@@ -177,7 +198,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
@@ -190,8 +211,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             wide_hidden = hidden_states.view(
                 hidden_states.shape[0], self.hc, self.n_embd
             )
-            x = self._fc_stage(inputs_embeds, wide_hidden)
-            residual = None
+            # The fc stage already produces the wide state, so hand it to the
+            # decoder layer as ``residual``; passing it as ``hidden_states``
+            # with ``residual=None`` would make the layer broadcast one
+            # stream into hc identical copies.
+            residual = self._fc_stage(inputs_embeds, wide_hidden)
+            # Not consumed by the layer when ``residual`` is not None.
+            x = residual.mean(dim=1)
         else:
             assert intermediate_tensors is not None
             x = intermediate_tensors["hidden_states"]
@@ -215,7 +241,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         # Final output norm = the top-level hyper-connection mixer.
         out, _ = self.hyper_connection_mixer.mix(wide_out)
-        return out
+        # Return (collapsed, wide-flat). The speculator sizes its
+        # multi-step feedback buffer for the HC-widened residual, so the
+        # feedback tensor must be the wide state; ``out`` stays the
+        # single stream consumed by the LM head. Matches the two-stream
+        # contract used by the amd/nvidia Qwen4Exp MTP.
+        wide_flat = wide_out.reshape(wide_out.shape[0], self.hc * self.n_embd)
+        return out, wide_flat
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The MTP decoder layer is a stock Qwen4ExpDecoderLayer (fused

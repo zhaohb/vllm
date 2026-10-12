@@ -1370,6 +1370,17 @@ class Qwen4ExpForConditionalGeneration(
         )
         return hidden_states
 
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        """Forward the MTP hook to the inner text model.
+
+        ``_target_feeds_hc_residual()`` in the speculator probes the
+        *top-level* architecture class, which for this checkpoint is the
+        VL wrapper. Without this delegation the hook is invisible and the
+        drafter is fed the collapsed hidden state instead of the wide
+        hyper-connection residual. Mirrors the amd/nvidia implementations.
+        """
+        return self.language_model.get_mtp_target_hidden_states()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Load the vision tower (``model.visual.*`` -> ``visual.*``) and the
         # text model (``model.language_model.*`` -> ``language_model.model.*``)
