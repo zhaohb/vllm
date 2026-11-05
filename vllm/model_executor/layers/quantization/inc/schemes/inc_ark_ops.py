@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -15,9 +16,36 @@ logger = init_logger(__name__)
 _OPS_REGISTERED = False
 
 
+def _host_cpu_lacks_avx512() -> bool:
+    """True on an x86 host without the AVX-512 subset ARK is built with.
+
+    The ARK XPU library carries host code compiled for AVX-512 (F, BW, DQ and
+    VL, e.g. ``vpmullq`` on XMM registers). On a CPU without it, such as AMD
+    Zen 2/3 (EPYC 7002/7003) or Intel client parts, the first call traps with
+    an invalid opcode. ``torch.cpu._is_avx512_supported`` checks that subset.
+    """
+    is_avx512_supported = getattr(torch.cpu, "_is_avx512_supported", None)
+    if is_avx512_supported is None:
+        return False
+    return not is_avx512_supported()
+
+
 @lru_cache(maxsize=1)
 def get_ark_state() -> tuple[bool, str | None, Any | None, Any | None]:
     """Return ARK availability, error details, cached module, and QuantLinear."""
+    # Only the "auto" backend steps aside: an explicit "ark" still loads ARK.
+    if (
+        current_platform.is_xpu()
+        and envs.VLLM_XPU_INC_WNA16_BACKEND == "auto"
+        and _host_cpu_lacks_avx512()
+    ):
+        logger.info(
+            "The host CPU lacks AVX-512 (F/BW/DQ/VL), which auto_round_kernel "
+            "requires; VLLM_XPU_INC_WNA16_BACKEND=auto falls back to the "
+            "w4a16 backend. Set VLLM_XPU_INC_WNA16_BACKEND=ark to force ARK."
+        )
+        return False, "the host CPU lacks AVX-512", None, None
+
     try:
         import auto_round_kernel as ark
         from auto_round_kernel.qlinear import QuantLinear

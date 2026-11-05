@@ -1563,6 +1563,46 @@ def test_wna16_xpu_prefers_ark_when_available(monkeypatch) -> None:
     assert isinstance(method.scheme, INCARKLinearMethod)
 
 
+@pytest.mark.parametrize(
+    ("backend", "has_avx512", "expect_available"),
+    [
+        ("auto", False, False),
+        ("auto", True, True),
+        ("ark", False, True),
+    ],
+)
+def test_ark_state_skips_ark_on_cpu_without_avx512(
+    monkeypatch, backend: str, has_avx512: bool, expect_available: bool
+) -> None:
+    import sys
+    import types
+
+    from vllm.model_executor.layers.quantization.inc.schemes import inc_ark_ops
+
+    class DummyQuantLinear:
+        pass
+
+    fake_ark = types.ModuleType("auto_round_kernel")
+    fake_ark.cpu_lib = None  # type: ignore[attr-defined]
+    fake_ark.xpu_lib = object()  # type: ignore[attr-defined]
+    fake_qlinear = types.ModuleType("auto_round_kernel.qlinear")
+    fake_qlinear.QuantLinear = DummyQuantLinear  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "auto_round_kernel", fake_ark)
+    monkeypatch.setitem(sys.modules, "auto_round_kernel.qlinear", fake_qlinear)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(torch.cpu, "_is_avx512_supported", lambda: has_avx512)
+    monkeypatch.setenv("VLLM_XPU_INC_WNA16_BACKEND", backend)
+    inc_ark_ops.get_ark_state.cache_clear()
+    try:
+        is_available, error, _, _ = inc_ark_ops.get_ark_state()
+    finally:
+        inc_ark_ops.get_ark_state.cache_clear()
+
+    assert is_available is expect_available
+    if not expect_available:
+        assert error is not None and "AVX-512" in error
+
+
 def test_inc_config_from_config_accepts_xpu_int2() -> None:
     def _make_int2_raw_config(**overrides) -> dict[str, object]:
         kwargs = {
