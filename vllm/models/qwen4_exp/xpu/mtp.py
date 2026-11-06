@@ -52,6 +52,8 @@ from vllm.models.qwen4_exp.xpu.model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpModel,
+    _uses_qsa,
+    get_qsa_topk_buffer_width,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -129,12 +131,24 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc_hidden",
         )
 
-        # The single MTP decoder layer (full attention + HC + MoE).
+        # The single MTP decoder layer (attention + HC + MoE): sparse when the
+        # target is, so the draft attends to the tokens the target selected.
+        topk_indices_buffer = None
+        layer_type = "full_attention"
+        if _uses_qsa(config):
+            layer_type = "qwen_sparse_attention"
+            # The proposer replaces this with the target model's buffer.
+            topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                get_qsa_topk_buffer_width(config),
+                dtype=torch.int32,
+            )
         self.layers = torch.nn.ModuleList(
             Qwen4ExpDecoderLayer(
                 vllm_config,
-                layer_type="full_attention",
+                layer_type=layer_type,
                 prefix=f"{prefix}.layers.{idx}",
+                topk_indices_buffer=topk_indices_buffer,
             )
             for idx in range(self.num_mtp_layers)
         )
@@ -145,6 +159,26 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+
+    def _iter_qsa_attentions(self):
+        """Yield MTP attention modules that own a QSA indexer."""
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            if getattr(attention, "indexer", None) is not None:
+                yield attention
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Select on MTP step 0 and reuse its QSA indices on later steps."""
+        for attention in self._iter_qsa_attentions():
+            attention.indexer.skip_topk = skip
+
+    def compact_topk_indices(self, row_indices: torch.Tensor) -> None:
+        """Keep each request's target-aligned step-0 sparse-index row."""
+        num_rows = row_indices.numel()
+        for attention in self._iter_qsa_attentions():
+            buffer = attention.topk_indices_buffer
+            selected = buffer.index_select(0, row_indices)
+            buffer[:num_rows].copy_(selected)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -313,13 +347,15 @@ class Qwen4ExpMTP(nn.Module, Qwen4ExpMixtureOfExperts):
         #   * ``mtp.*`` -> remapped to ``model.*`` (the predictor)
         #   * shared ``embed_tokens`` (strip the VL-wrapper prefix)
         #   * shared ``lm_head``
-        # Everything else (main layers, visual tower, PLE) is skipped, as is
-        # the MTP layer's QSA indexer: the XPU backend runs dense attention.
+        # Everything else (main layers, visual tower, PLE) is skipped, and so
+        # is the MTP layer's QSA indexer when the draft runs dense attention.
         shared_weight_names = ("embed_tokens", "lm_head")
+
+        keep_indexer = _uses_qsa(self.config)
 
         def remap_weight_names(weights):
             for name, weight in weights:
-                if ".indexer." in name:
+                if ".indexer." in name and not keep_indexer:
                     continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
