@@ -5,6 +5,7 @@
 import torch
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
@@ -14,6 +15,15 @@ from vllm.utils.math_utils import round_up
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
+# Intel Triton 3.8 rejects tl.dot with N below the sub-group size (16), and a
+# plain decode scores N = 1 query row x 4 heads.
+_DECODE_MIN_DOT_N = 16 if current_platform.is_xpu() else 1
+# (TILE_R, BLOCK_N, K_TILES, STAGES, num_warps) of the BF16 prefill scorer on Xe2.
+# The fastest measured on a B70 (Triton 3.8.0+xpu, IGC 2.41.5) at 4,096 rows: 1.0 ms
+# at 32K of context and 4.3 ms at 131K, against 11.2 and 45.9 for the GB300 launch,
+# whose tile spills. Keep the warps: at this tile num_warps 2 compiles and scores
+# wrong. FP8 has no such sweep and keeps the GB300 launch.
+_XPU_BF16_PREFILL_LAUNCH = (32, 128, 16, 1, 16)
 
 
 @triton.jit
@@ -37,10 +47,14 @@ def _qsa_mqa_paged_uniform_kernel(
     BLOCK_N: tl.constexpr,
     TILES_PER_PROG: tl.constexpr,
     STAGES: tl.constexpr,
+    MIN_DOT_N: tl.constexpr = 1,
 ) -> None:
     NUM_COLUMNS: tl.constexpr = PAGE_TABLE_WIDTH * PAGE_SIZE
-    DECODE_QUERY_LEN_PADDED: tl.constexpr = triton.next_power_of_2(DECODE_QUERY_LEN)
     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
+    # Padded query rows are masked; they only lift the dot's N to MIN_DOT_N.
+    DECODE_QUERY_LEN_PADDED: tl.constexpr = max(
+        triton.next_power_of_2(DECODE_QUERY_LEN), MIN_DOT_N // NUM_HEADS_PADDED
+    )
     # tl.dot requires a reduction dimension of at least 16.
     BLOCK_D: tl.constexpr = max(16, triton.next_power_of_2(HEAD_DIM))
     request = tl.program_id(0)
@@ -368,6 +382,7 @@ def warmup_qsa_mqa_paged_decode(
             BLOCK_N=_DECODE_BLOCK_N,
             TILES_PER_PROG=tiles_per_program,
             STAGES=2,
+            MIN_DOT_N=_DECODE_MIN_DOT_N,
             # tuned on GB300
             num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
             grid=(
@@ -376,6 +391,17 @@ def warmup_qsa_mqa_paged_decode(
             ),
         )
     return profiles
+
+
+def _prefill_launch(dtype: torch.dtype) -> tuple[int, int, int, int, int]:
+    """(TILE_R, BLOCK_N, K_TILES, STAGES, num_warps) of the prefill scorer."""
+    # tuned on GB300
+    if dtype == torch.float8_e4m3fn:
+        return 32, 64, 16, 2, 8
+    if current_platform.is_xpu():
+        return _XPU_BF16_PREFILL_LAUNCH
+    # tuned on GB300
+    return 64, 64, 16, 2, 4
 
 
 def _prefill_logits(
@@ -402,13 +428,8 @@ def _prefill_logits(
         num_queries, logits_width
     )
 
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
-    else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
-    BLOCK_N = 64
-    K_TILES = 16
+    launch = _prefill_launch(k_cache.dtype)
+    TILE_R, BLOCK_N, K_TILES, STAGES, num_warps = launch
     grid = (
         page_table.shape[0],
         triton.cdiv(min(num_queries, max_query_len), TILE_R),
@@ -484,6 +505,20 @@ def _topk(
 ) -> None:
     # similar dispatch logic as DeepSeek indexer
     block_topk = token_topk // compress_ratio
+    if current_platform.is_xpu():
+        # vllm-xpu-kernels' top_k_per_row_decode with next_n=1 bounds row i
+        # by visible_blocks[i], like cooperative/persistent_topk.
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            visible_blocks,
+            block_indices,
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            block_topk,
+        )
+        return
     use_cooperative_topk = (
         logits.shape[0] <= 64
         and logits.stride(0) % 4 == 0
@@ -564,6 +599,7 @@ def qsa_select_paged_decode(
         BLOCK_N=_DECODE_BLOCK_N,
         TILES_PER_PROG=tiles_per_program,
         STAGES=2,
+        MIN_DOT_N=_DECODE_MIN_DOT_N,
         # tuned on GB300
         num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
     )
