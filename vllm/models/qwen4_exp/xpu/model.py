@@ -21,10 +21,11 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from itertools import islice
+from typing import ClassVar
 
+import regex as re
 import torch
 from torch import nn
 from transformers import (
@@ -32,6 +33,7 @@ from transformers import (
     Qwen4ExpTextConfig,
 )
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -189,7 +191,7 @@ class _WeightContainer(nn.Module):
     sits at the exact ``<name>.weight`` path the checkpoint expects.
     """
 
-    def __init__(self, shape: tuple[int, ...]):
+    def __init__(self, shape: Sequence[int]):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(*shape))
 
@@ -488,6 +490,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         if self._shard_starts is None and self._dummy_load:
             return torch.zeros(rows.numel(), self.head_dim, dtype=torch.bfloat16)
         starts = self._shard_starts
+        assert starts is not None
         if rows.numel() and int(rows.min()) < 0:
             raise IndexError("PLE row id must be non-negative")
         shard = torch.searchsorted(starts, rows, right=True) - 1
@@ -504,6 +507,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         emb = out.view(self._ckpt_dtype)
         if self._ckpt_dtype == torch.float8_e4m3fn:
             # Same dequantization as the CUDA/ROCm FP8 PLE embedding.
+            assert self._ckpt_scale is not None
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
@@ -568,6 +572,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             non_spec_token_indices = metadata.non_spec_token_indx
 
         if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
             ple_conv(
                 inputs,
                 residual,
@@ -586,6 +591,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             return
 
         state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
         if not has_prefill:
             num_decode_rows = (
                 non_spec_token_indices.numel()
@@ -684,6 +690,7 @@ def _ple_layer(layer_name: str) -> Qwen4ExpPLE:
     return layer
 
 
+@eager_break_during_capture
 def qwen4_exp_xpu_ple_lookup(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -696,6 +703,7 @@ def qwen4_exp_xpu_ple_lookup(
     output.copy_(layer.lookup(input_ids, query_start_loc, ngram_context))
 
 
+@eager_break_during_capture
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
@@ -860,6 +868,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """MoE metadata mixin for Qwen4-Exp (matches ``Qwen4ExpDecoderLayer``)."""
 
+    model: "Qwen4ExpModel"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -869,22 +880,24 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for layer in self.model.layers:
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                moe = layer.mlp
-                moe.n_local_physical_experts = num_local_physical_experts
-                moe.n_physical_experts = num_physical_experts
-                moe.n_redundant_experts = self.num_redundant_experts
-                moe.experts.update_expert_map()
+        # Walk the MoE blocks collected at init: under PP, the layers of other
+        # stages are PPMissingLayer and have no ``mlp``.
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def set_moe_parameters(self):
         self.moe_layers = []
+        self.moe_mlp_layers: list[Qwen3NextSparseMoeBlock] = []
         example_moe = None
         for layer in self.model.layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
                 layer.mlp, Qwen3NextSparseMoeBlock
             ):
                 example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
         if example_moe is None:
@@ -933,10 +946,19 @@ class Qwen4ExpModel(Qwen3NextModel):
         self.hc = config.hc_count
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # Only the first PP stage embeds tokens; the last one also keeps the
+        # table when the LM head is tied to it.
+        pp_group = get_pp_group()
+        self.embed_tokens: VocabParallelEmbedding | PPMissingLayer
+        if pp_group.is_first_rank or (
+            config.tie_word_embeddings and pp_group.is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # One top-k buffer shared by all QSA layers. It lives on the model, not in a
         # local, so a draft model can share it.
@@ -962,17 +984,18 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Custom intermediate-tensors factory: the residual is the wide
         # hyper-connection state [T, hc, n_embd].
-        def _make_empty_intermediate_tensors(num_tokens, dtype, device):
+        # The runners pass the size as ``batch_size=`` (models/utils.py).
+        def _make_empty_intermediate_tensors(batch_size, dtype, device):
             return IntermediateTensors(
                 {
                     "hidden_states": torch.empty(
-                        num_tokens,
+                        batch_size,
                         config.hidden_size,
                         dtype=dtype,
                         device=device,
                     ),
                     "residual": torch.empty(
-                        num_tokens,
+                        batch_size,
                         config.hc_count,
                         config.hidden_size,
                         dtype=dtype,
@@ -1052,7 +1075,8 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
-        if getattr(self, "_mtp_hidden_buffer", None) is not None:
+        if self._mtp_hidden_buffer is not None:
+            assert residual is not None
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
@@ -1126,6 +1150,8 @@ class Qwen4ExpForCausalLM(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+
+    requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -1350,6 +1376,9 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
     model is nested under ``language_model``).
     """
 
+    language_model: "Qwen4ExpForCausalLM"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1359,22 +1388,24 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for layer in self.language_model.model.layers:
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                moe = layer.mlp
-                moe.n_local_physical_experts = num_local_physical_experts
-                moe.n_physical_experts = num_physical_experts
-                moe.n_redundant_experts = self.num_redundant_experts
-                moe.experts.update_expert_map()
+        # Walk the MoE blocks collected at init: under PP, the layers of other
+        # stages are PPMissingLayer and have no ``mlp``.
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def set_moe_parameters(self):
         self.moe_layers = []
+        self.moe_mlp_layers: list[Qwen3NextSparseMoeBlock] = []
         example_moe = None
         for layer in self.language_model.model.layers:
             if isinstance(layer, Qwen4ExpDecoderLayer) and isinstance(
                 layer.mlp, Qwen3NextSparseMoeBlock
             ):
                 example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
         if example_moe is None:
@@ -1411,8 +1442,9 @@ class Qwen4ExpForConditionalGeneration(
     processor, and MRoPE wiring are reused verbatim.
     """
 
+    requires_raw_input_tokens = True
     supports_multimodal_pruning = True
-    is_3d_moe_weight: bool = True
+    is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -1425,6 +1457,10 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError(
+                "Qwen4ExpForConditionalGeneration requires multimodal_config"
+            )
 
         self.config = config
         self.model_config = vllm_config.model_config
