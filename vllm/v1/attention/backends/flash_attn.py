@@ -15,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, WarmupChoices
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
+    STR_DTYPE_TO_TORCH_DTYPE,
     canonicalize_singleton_dim_strides,
 )
 from vllm.v1.attention.backend import (
@@ -1472,13 +1473,21 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
+        # The op's dtype argument names "auto" and the quantized formats only. A
+        # plain dtype string spelling the K/V's own dtype (a draft's explicit
+        # "bfloat16") is the same write as "auto".
+        op_kv_cache_dtype = (
+            "auto"
+            if STR_DTYPE_TO_TORCH_DTYPE.get(self.kv_cache_dtype) == key.dtype
+            else self.kv_cache_dtype
+        )
         reshape_and_cache_flash(
             key,
             value,
             key_cache,
             value_cache,
             slot_mapping,
-            self.kv_cache_dtype,
+            op_kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
         )

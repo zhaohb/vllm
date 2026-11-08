@@ -786,7 +786,6 @@ class _QSAIndexerCache(nn.Module, AttentionLayerBase):
             )
         self.head_size = head_size
         self.dtype = dtype
-        self.cache_config = cache_config
         self.prefix = prefix
         self.compress_ratio = compress_ratio
         self.kv_cache = torch.tensor([])
@@ -853,9 +852,15 @@ class QSARawKeyCache(_QSAIndexerCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = round_up(span, self.compress_ratio)
-        assert self.cache_config.block_size % capacity == 0, (
+        # A wider ring is equally correct, it only adds slack. So when the minimum
+        # doesn't divide the block, take the next whole-group size that does: 7
+        # drafts need 12, and the 832-token block on XPU takes 16.
+        block_size = vllm_config.cache_config.block_size
+        while block_size % capacity and capacity < block_size:
+            capacity += self.compress_ratio
+        assert block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
-            f"size {self.cache_config.block_size}"
+            f"size {block_size}"
         )
         return CircularBufferSpec(
             block_size=capacity,
@@ -870,9 +875,11 @@ class QSACompressedKeyCache(_QSAIndexerCache):
     """Normed, group-first-RoPE key at one row per complete group."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        del vllm_config
+        # Read the block size from the config passed here. The constructor's
+        # cache config can be a copy made for a draft with its own KV dtype, and
+        # that copy keeps the block size from before the platform resolved it.
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,

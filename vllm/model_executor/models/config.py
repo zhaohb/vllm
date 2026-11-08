@@ -9,7 +9,7 @@ from vllm.utils.math_utils import round_up
 if TYPE_CHECKING:
     from transformers import PreTrainedConfig
 
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config import CacheConfig, ModelConfig, SpeculativeConfig, VllmConfig
     from vllm.config.cache import MambaDType
 
 
@@ -1262,6 +1262,45 @@ def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
             rope_parameters.pop("mrope_interleaved", None)
 
 
+def _verify_qwen4_exp_dflash2(spec_config: "SpeculativeConfig", text_config) -> None:
+    """Refuse what the Qwen4Exp target-feature capture was not built for.
+
+    The XPU model captures each layer the drafter's ``target_layer_ids`` name,
+    completed and averaged over the hyper-connection streams, which is the
+    feature a DFlash2 drafter for this model is trained on. The drafter must
+    match the target's hidden and vocab sizes, and a block of ``block_size``
+    holds at most ``block_size - 1`` proposals.
+    """
+    from vllm.platforms import current_platform
+
+    draft = spec_config.draft_model_config.hf_config
+    dflash_config = getattr(draft, "dflash_config", None) or {}
+    layer_ids = dflash_config.get("target_layer_ids")
+    layers_ok = (
+        isinstance(layer_ids, list)
+        and len(layer_ids) > 0
+        and all(
+            isinstance(i, int) and 1 <= i <= text_config.num_hidden_layers
+            for i in layer_ids
+        )
+    )
+    if (
+        not current_platform.is_xpu()
+        or draft.architectures != ["DFlash2DraftModel"]
+        or not layers_ok
+        or draft.hidden_size != text_config.hidden_size
+        or draft.vocab_size != text_config.vocab_size
+        or not 1
+        <= spec_config.num_speculative_tokens
+        < dflash_config.get("block_size", 0)
+    ):
+        raise NotImplementedError(
+            "Qwen4Exp DFlash2 needs XPU, a DFlash2DraftModel drafter whose "
+            "target_layer_ids lie within the target's layers and whose hidden and "
+            "vocab sizes match it, and proposals within the trained block"
+        )
+
+
 class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
@@ -1295,14 +1334,16 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
-        if spec_config is not None and spec_config.method not in {
+        if spec_config is not None and spec_config.method == "dflash":
+            _verify_qwen4_exp_dflash2(spec_config, text_config)
+        elif spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "checkpoint, DFlash2 on XPU and linear n-gram proposers"
             )
 
 

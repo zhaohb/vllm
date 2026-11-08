@@ -39,6 +39,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
+    STR_DTYPE_TO_TORCH_DTYPE,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -204,13 +205,21 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
     ) -> None:
         """Scatter K/V using the same layout and scales as the fused writer."""
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        # The op's dtype argument names "auto" and the quantized formats only. A
+        # plain dtype string spelling the K/V's own dtype (a draft's explicit
+        # "bfloat16") is the same write as "auto".
+        op_kv_cache_dtype = (
+            "auto"
+            if STR_DTYPE_TO_TORCH_DTYPE.get(self.kv_cache_dtype) == key.dtype
+            else self.kv_cache_dtype
+        )
         ops.reshape_and_cache_flash(
             key,
             value,
             key_cache,
             value_cache,
             slot_mapping,
-            self.kv_cache_dtype,
+            op_kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
         )

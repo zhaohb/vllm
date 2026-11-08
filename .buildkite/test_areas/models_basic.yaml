@@ -454,7 +454,11 @@ steps:
     - >-
       pytest -v -s
       models/qwen4_exp/test_config.py
+      models/qwen4_exp/test_xpu_dflash.py
       models/qwen4_exp/test_ple.py
+      models/qwen4_exp/test_qsa_fp8_levers.py
+      models/qwen4_exp/test_fp8_draft_prefix_cache.py
+      models/qwen4_exp/test_xpu_hc.py
 
 - label: ":nvidia: (B200) Qwen3.5"
   key: qwen3-5-unit-tests-b200
