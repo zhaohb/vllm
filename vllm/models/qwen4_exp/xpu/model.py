@@ -21,10 +21,11 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from itertools import islice
+from typing import ClassVar
 
+import regex as re
 import torch
 from torch import nn
 from transformers import (
@@ -102,7 +103,11 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
-from ..nvidia.model import get_qsa_topk_buffer_width
+from ..nvidia.model import (
+    _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
+    _remap_qsa_cache_scale_name,
+    get_qsa_topk_buffer_width,
+)
 from ..nvidia.qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
@@ -189,7 +194,7 @@ class _WeightContainer(nn.Module):
     sits at the exact ``<name>.weight`` path the checkpoint expects.
     """
 
-    def __init__(self, shape: tuple[int, ...]):
+    def __init__(self, shape: Sequence[int]):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(*shape))
 
@@ -488,6 +493,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         if self._shard_starts is None and self._dummy_load:
             return torch.zeros(rows.numel(), self.head_dim, dtype=torch.bfloat16)
         starts = self._shard_starts
+        assert starts is not None
         if rows.numel() and int(rows.min()) < 0:
             raise IndexError("PLE row id must be non-negative")
         shard = torch.searchsorted(starts, rows, right=True) - 1
@@ -504,6 +510,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         emb = out.view(self._ckpt_dtype)
         if self._ckpt_dtype == torch.float8_e4m3fn:
             # Same dequantization as the CUDA/ROCm FP8 PLE embedding.
+            assert self._ckpt_scale is not None
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
@@ -568,6 +575,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             non_spec_token_indices = metadata.non_spec_token_indx
 
         if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
             ple_conv(
                 inputs,
                 residual,
@@ -586,6 +594,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             return
 
         state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
         if not has_prefill:
             num_decode_rows = (
                 non_spec_token_indices.numel()
@@ -860,6 +869,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """MoE metadata mixin for Qwen4-Exp (matches ``Qwen4ExpDecoderLayer``)."""
 
+    model: "Qwen4ExpModel"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1052,7 +1064,8 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
-        if getattr(self, "_mtp_hidden_buffer", None) is not None:
+        if self._mtp_hidden_buffer is not None:
+            assert residual is not None
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
@@ -1068,11 +1081,19 @@ class Qwen4ExpModel(Qwen3NextModel):
         # Indexer tensors of layers that run dense (no QSA indexer in the
         # config, or a layer type that is not indexed) are dropped and
         # reported.
+        # Serialized main-cache scales of QSA layers move onto the QSA owner's
+        # ``_k_scale``/``_v_scale``, as on CUDA.
         saw_indexer = False
+        qsa_layer_ids = frozenset(
+            index
+            for index, layer in enumerate(self.layers)
+            if isinstance(getattr(layer, "self_attn", None), Qwen4ExpQSAAttention)
+        )
 
         def route(weights: Iterable[tuple[str, torch.Tensor]]):
             nonlocal saw_indexer
             for name, tensor in weights:
+                name = _remap_qsa_cache_scale_name(name, qsa_layer_ids)
                 match = _INDEXER_RE.match(name)
                 if match is not None and not isinstance(
                     getattr(self.layers[int(match.group(1))], "self_attn", None),
@@ -1088,7 +1109,10 @@ class Qwen4ExpModel(Qwen3NextModel):
                     continue
                 yield name, tensor
 
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+        )
         loaded = loader.load_weights(route(weights), mapper=self.hf_to_vllm_mapper)
         if saw_indexer:
             _report_dense_qsa(self.config, self.max_model_len)
@@ -1327,6 +1351,7 @@ class Qwen4ExpForCausalLM(
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=["mtp.", "model.visual."],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
@@ -1349,6 +1374,9 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
     through ``self.language_model.model`` (the wrapper layout, where the text
     model is nested under ``language_model``).
     """
+
+    language_model: "Qwen4ExpForCausalLM"
+    num_local_physical_experts: int
 
     def update_physical_experts_metadata(
         self,
@@ -1412,7 +1440,7 @@ class Qwen4ExpForConditionalGeneration(
     """
 
     supports_multimodal_pruning = True
-    is_3d_moe_weight: bool = True
+    is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -1425,6 +1453,10 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError(
+                "Qwen4ExpForConditionalGeneration requires multimodal_config"
+            )
 
         self.config = config
         self.model_config = vllm_config.model_config
@@ -1517,6 +1549,7 @@ class Qwen4ExpForConditionalGeneration(
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=["mtp."],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

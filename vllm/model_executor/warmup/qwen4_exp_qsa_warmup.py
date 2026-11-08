@@ -74,15 +74,29 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         warmup_qsa_sparse_paged_attention,
     )
 
-    kv_cache = owner.kv_cache
-    assert kv_cache.numel()
-    attention_profiles = warmup_qsa_sparse_paged_attention(
-        kv_cache,
-        block_table_for(owner.layer_name),
-        num_query_heads=owner.num_heads,
-        selection_width=indexer.output_width,
-    )
-    logger.info(
-        "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
-        attention_profiles,
-    )
+    # A draft with its own KV dtype (speculative_config.kv_cache_dtype) specializes
+    # the attention kernels differently from the target.
+    owners = [owner]
+    draft_model = getattr(getattr(runner, "drafter", None), "model", None)
+    if draft_model is not None:
+        for layer in draft_model.modules():
+            if (
+                isinstance(layer, attn_module.Qwen4ExpQSAAttention)
+                and layer.kv_cache_dtype != owner.kv_cache_dtype
+            ):
+                owners.append(layer)
+                break
+    for attention in owners:
+        kv_cache = attention.kv_cache
+        assert kv_cache.numel()
+        attention_profiles = warmup_qsa_sparse_paged_attention(
+            kv_cache,
+            block_table_for(attention.layer_name),
+            num_query_heads=attention.num_heads,
+            selection_width=indexer.output_width,
+        )
+        logger.info(
+            "Warmed up Qwen4Exp QSA sparse attention kernels (%s): %s.",
+            attention.kv_cache_dtype,
+            attention_profiles,
+        )
