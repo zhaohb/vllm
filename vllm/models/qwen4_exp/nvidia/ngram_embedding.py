@@ -96,7 +96,8 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
         self._dummy = get_current_vllm_config().load_config.load_format == "dummy"
         # NVFP4 rows are packed E2M1 bytes plus a separate plane of block scales.
         self._nvfp4 = isinstance(embedding_method, Qwen4ExpPLENvFp4EmbeddingMethod)
-        device, pin = self.weight.device, self.weight.is_cuda
+        device = self.weight.device
+        pin = device.type in ("cuda", "xpu")
         rows = (max_total_tokens, num_ngram_heads)
         self._host_ids = torch.empty(
             rows, dtype=torch.long, device="cpu", pin_memory=pin

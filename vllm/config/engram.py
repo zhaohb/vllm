@@ -35,7 +35,9 @@ class EngramConfig:
     """Configuration for Engram embedding storage and sharding."""
 
     cpu_offload: bool = True
-    """Store embedding weights in pinned CPU memory for UVA lookup."""
+    """Store embedding weights in pinned CPU memory for UVA lookup. Without this
+    or disk_offload, a Qwen4Exp PLE table on XPU stays in the mapped checkpoint
+    files, which is the default there; other platforms keep it on the device."""
 
     disk_offload: bool = False
     """Keep Qwen4Exp PLE tables in the checkpoint files and read each step's
@@ -60,6 +62,16 @@ class EngramConfig:
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
     startup takes longer. Requires cpu_offload without dp_shared_memory.
     Always on for private tables on ROCm."""
+
+    @classmethod
+    def default_for_model(cls, model_config: "ModelConfig") -> Self:
+        """The settings of a model with n-gram layers without --engram-config."""
+        from vllm.platforms import current_platform
+
+        field = _NGRAM_LAYER_FIELDS.get(model_config.architecture)
+        if field == "ple_layer_ids" and current_platform.is_xpu():
+            return cls(cpu_offload=False)
+        return cls()
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
@@ -90,8 +102,12 @@ class EngramConfig:
         if self.disk_offload:
             from vllm.platforms import current_platform
 
-            if field != "ple_layer_ids" or not current_platform.is_cuda():
-                raise ValueError("disk_offload requires a Qwen4Exp model on CUDA")
+            if field != "ple_layer_ids" or not (
+                current_platform.is_cuda() or current_platform.is_xpu()
+            ):
+                raise ValueError(
+                    "disk_offload requires a Qwen4Exp model on CUDA or XPU"
+                )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""

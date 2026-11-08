@@ -1605,7 +1605,7 @@ class VllmConfig:
         if self.engram_config is None:
             if not model_has_engram_layers(model_config):
                 return
-            self.engram_config = EngramConfig()
+            self.engram_config = EngramConfig.default_for_model(model_config)
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)

@@ -11,8 +11,8 @@ full-attention + MoE) extended with:
   ``[T, n_embd]`` view and writes back through per-stream injection
   weights. The top-level ``hyper_connection_mixer`` acts as the final
   output norm (there is no separate RMSNorm).
-- **PLE** n-gram embedding table, served on host from the checkpoint shards
-  (see ``Qwen4ExpPLE``).
+- **PLE** n-gram embedding table, placed by ``--engram-config`` (see
+  ``Qwen4ExpPLE``).
 - **QSA** sparse attention on the indexed layers, via the CUDA
   ``Qwen4ExpQSAAttention`` when the config carries a QSA indexer
   (``indexer_n_heads``). Without one, those layers run dense.
@@ -21,10 +21,12 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from itertools import islice
+from typing import ClassVar
 
+import regex as re
 import torch
 from torch import nn
 from transformers import (
@@ -32,6 +34,7 @@ from transformers import (
     Qwen4ExpTextConfig,
 )
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -39,8 +42,16 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.abstract import (
+    MambaBase,
+    get_mamba_prefill_checkpoint_alignment,
+    get_mamba_prefill_checkpoint_grid,
+)
+from vllm.model_executor.layers.mamba.checkpoint import (
+    MambaPrefillCheckpointExporter,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -91,18 +102,24 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
 from ..nvidia.model import get_qsa_topk_buffer_width
+from ..nvidia.ngram_embedding import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEDiskOffloadEmbedding,
+    Qwen4ExpPLENvFp4EmbeddingMethod,
+)
 from ..nvidia.qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
@@ -189,7 +206,7 @@ class _WeightContainer(nn.Module):
     sits at the exact ``<name>.weight`` path the checkpoint expects.
     """
 
-    def __init__(self, shape: tuple[int, ...]):
+    def __init__(self, shape: Sequence[int]):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(*shape))
 
@@ -320,16 +337,27 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
     """Per-Layer Embedding (n-gram table) for Qwen4-Exp, layer 1 only.
 
     The n-gram table (320M rows: ~95 GiB in BF16, ~48 GiB in FP8) never
-    becomes a device param. The checkpoint's ``ngram_embedding.shard_*``
-    tensors (BF16, or FP8 with a global ``weight_scale``) are kept as the
-    loader's zero-copy mmap views of the checkpoint files, so the table lives
-    in the page cache (shared across TP ranks); rows are gathered on host and
-    only those move to the device.
+    becomes a device param. ``--engram-config`` places it:
+
+    - Default (``cpu_offload`` and ``disk_offload`` off): the checkpoint's
+      ``ngram_embedding.shard_*`` tensors (BF16, or FP8 with a global
+      ``weight_scale``) are kept as the loader's zero-copy mmap views of the
+      checkpoint files, so the table lives in the page cache (shared across TP
+      ranks); rows are gathered on host and only those move to the device.
+    - ``cpu_offload``: the shared pinned table, each rank holding its share and
+      the forward reading it through UVA, as on ROCm. No host read.
+    - ``disk_offload``: the shared disk table, as on CUDA: rows are read from
+      the checkpoint files, without relying on the page cache staying warm.
+
+    ``Qwen4ExpModelState`` runs ``stage_ple_rows`` before the forward: 16 row
+    ids per token are hashed on device from the step's tokens and the request's
+    preceding tokens (``ngram_context``, rebuilt every step from the token
+    history). The two file-backed tables read them back and copy the rows to a
+    fixed device buffer. The forward only reads a fixed buffer, so graphs replay
+    it.
 
     The rest follows the CUDA/ROCm PLE layer and runs the shared kernels:
-    16 row ids per token are hashed on device from the step's tokens and the
-    request's preceding tokens (``ngram_context``, rebuilt every step from the
-    token history by ``Qwen4ExpModelState``); key/value proj -> grouped
+    key/value proj -> grouped
     RMSNorm gate -> dilated causal conv (kernel 4, dilation 3) -> added to the
     wide residual ``[T, hc, n_embd]``. The conv history is a vLLM-managed
     short-conv Mamba state, so prefix caching and spec-decode rollback cover
@@ -341,6 +369,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         config: Qwen4ExpTextConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        ple_dense_layer_id: int = 0,
     ):
         super().__init__()
         self.hc = config.hc_count
@@ -355,6 +384,9 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self.dil = self.ngram
         self.hist = (self.kern - 1) * self.dil
         self.eos = int(config.eos_token_id)
+        # The conv window ending at a prefill checkpoint is a copy of its last
+        # inputs.
+        self._checkpoint_exporter = MambaPrefillCheckpointExporter(state_len=self.hist)
 
         self.prefix = prefix
         self.model_config = vllm_config.model_config
@@ -366,24 +398,85 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # BF16 weights (unquantized in the checkpoints, like HC).
-        self.key_proj = _WeightContainer([self.hc_dim, self.n_embd])
-        self.value_proj = _WeightContainer([self.n_embd, self.n_embd])
+        # BF16 weights (unquantized in the checkpoints, like HC). The key and
+        # value projections read the same rows, so they run as one GEMM.
+        self.kv_proj = MergedColumnParallelLinear(
+            config.ple_embed_dim,
+            [self.hc_dim, self.n_embd],
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.kv_proj",
+            return_bias=False,
+            disable_tp=True,
+        )
         self.conv1d = _WeightContainer([self.hc_dim, 1, self.kern])
         self.norm_key = _WeightContainer([self.hc_dim])
         self.norm_query = _WeightContainer([self.hc_dim])
         self.norm_conv = _WeightContainer([self.hc_dim])
-        self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        engram_config = vllm_config.engram_config
+        self.table_is_mapped = engram_config is None or not (
+            engram_config.cpu_offload or engram_config.disk_offload
+        )
+        self.ple_embedding: PLEEmbedding | Qwen4ExpNGramEmbedding
+        if self.table_is_mapped:
+            self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
+            # Runs the post-load validation of the mapped table.
+            self.quant_method = _PLETableFinalizer()
+        else:
+            self.ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                ple_dense_layer_id,
+                max_tokens,
+                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+                prefix=f"{prefix}.ple_embedding",
+                quant_config=vllm_config.quant_config,
+                params_dtype=vllm_config.model_config.dtype,
+            )
+            method = self.ple_embedding.ngram_embedding.embedding_method
+            if isinstance(method, Qwen4ExpPLENvFp4EmbeddingMethod):
+                raise NotImplementedError(
+                    "NVFP4 Qwen4Exp PLE tables are not supported on XPU yet; use a "
+                    "checkpoint with a BF16 or FP8 PLE table."
+                )
+        self.table_on_disk = not self.table_is_mapped and isinstance(
+            self.ple_embedding.ngram_embedding, Qwen4ExpPLEDiskOffloadEmbedding
+        )
+        logger.info_once(
+            "XPU PLE table: %s (--engram-config %s).",
+            "in the mapped checkpoint files"
+            if self.table_is_mapped
+            else "read from the checkpoint files"
+            if self.table_on_disk
+            else "in pinned host memory, looked up through UVA",
+            str(engram_config),
+        )
 
         # Checkpoint n-gram table shards (collected at load time, validated by
         # the post-load hook). Dummy loads ship no shards; their lookups
         # return zeros.
-        self.quant_method = _PLETableFinalizer()
         self._dummy_load = vllm_config.load_config.load_format == "dummy"
         self._ckpt_shards: dict[int, torch.Tensor] = {}
         self._ckpt_scale: torch.Tensor | None = None
         self._ckpt_dtype: torch.dtype | None = None
         self._shard_starts: torch.Tensor | None = None
+
+        # Fixed per-step buffers: the row ids, and for the mapped table the rows.
+        # The host ones are written only after the step's stream sync, so after
+        # the previous step's copy has finished.
+        self._row_ids = torch.zeros(max_tokens, self.n_heads, dtype=torch.int64)
+        if not self.table_is_mapped:
+            return
+        embed_dim = self.n_heads * self.head_dim
+        self._staged_rows = torch.zeros(max_tokens, embed_dim, dtype=torch.bfloat16)
+        pin = self._staged_rows.device.type == "xpu"
+        self._host_ids = torch.empty(
+            max_tokens, self.n_heads, dtype=torch.int64, device="cpu", pin_memory=pin
+        )
+        self._host_rows = torch.empty(
+            max_tokens, embed_dim, dtype=torch.bfloat16, device="cpu", pin_memory=pin
+        )
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -407,6 +500,26 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             intermediate_size=self.hc_dim,
             conv_kernel=self.hist + 1,
             num_spec=self.num_spec_tokens,
+        )
+
+    def get_prefill_checkpoint_alignment(self) -> int | None:
+        return 1 if self.cache_config.mamba_cache_mode == "align" else None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        # The scheduler takes internal checkpoints only when every Mamba layer
+        # can export them.
+        if (
+            self.get_prefill_checkpoint_alignment() is None
+            or get_mamba_prefill_checkpoint_alignment(vllm_config) is None
+            or not isinstance(spec, MambaSpec)
+        ):
+            return spec
+        grid = get_mamba_prefill_checkpoint_grid(vllm_config)
+        # Offsets are multiples of the grid, so the window holds only inputs.
+        assert grid >= self.hist
+        return replace(
+            spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=grid
         )
 
     def accept_checkpoint_tensor(self, name: str, tensor: torch.Tensor) -> None:
@@ -488,6 +601,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         if self._shard_starts is None and self._dummy_load:
             return torch.zeros(rows.numel(), self.head_dim, dtype=torch.bfloat16)
         starts = self._shard_starts
+        assert starts is not None
         if rows.numel() and int(rows.min()) < 0:
             raise IndexError("PLE row id must be non-negative")
         shard = torch.searchsorted(starts, rows, right=True) - 1
@@ -504,23 +618,25 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         emb = out.view(self._ckpt_dtype)
         if self._ckpt_dtype == torch.float8_e4m3fn:
             # Same dequantization as the CUDA/ROCm FP8 PLE embedding.
+            assert self._ckpt_scale is not None
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
-    def lookup(
+    @property
+    def reads_rows_on_host(self) -> bool:
+        return self.table_is_mapped or self.table_on_disk
+
+    def hash_rows(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
-    ) -> torch.Tensor:
-        """N-gram embeddings ``[T, n_heads * head_dim]`` (BF16, on device).
-
-        Row ids are hashed on device, then the rows are gathered from the
-        host-side table and moved to the device.
-        """
+    ) -> None:
+        """Hash this step's row ids on device and queue their copy to host."""
         emb = self.ple_embedding
-        rows = ple_ngram_ids(
-            input_ids=input_ids.reshape(-1),
+        input_ids = input_ids.reshape(-1)
+        ids = ple_ngram_ids(
+            input_ids=input_ids,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             layer_multipliers=emb.layer_multipliers,
@@ -528,9 +644,36 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             ngram_heads_offsets=emb.ngram_heads_offsets,
             eos_token_id=self.eos,
             heads_per_ngram=self.per_gram,
+            output=self._row_ids[: input_ids.shape[0]],
         )
-        out = self._gather_rows(rows.reshape(-1).cpu())
-        return out.reshape(rows.shape[0], -1).to(input_ids.device)
+        if self.table_on_disk:
+            self.ple_embedding.ngram_embedding.copy_ids_to_host(ids)
+        elif self.table_is_mapped:
+            self._host_ids[: ids.shape[0]].copy_(ids, non_blocking=True)
+
+    def stage_rows(self, num_tokens: int) -> None:
+        """Read the step's rows on host and queue their copy to the device."""
+        if self.table_on_disk:
+            self.ple_embedding.ngram_embedding.stage_rows(num_tokens)
+            return
+        if not self.table_is_mapped:
+            return
+        rows = self._gather_rows(self._host_ids[:num_tokens].reshape(-1))
+        self._host_rows[:num_tokens].copy_(rows.reshape(num_tokens, -1))
+        self._staged_rows[:num_tokens].copy_(
+            self._host_rows[:num_tokens], non_blocking=True
+        )
+
+    def lookup(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
+        """This step's n-gram embeddings ``[T, n_heads * head_dim]`` on device."""
+        if self.table_is_mapped:
+            return self._staged_rows[:num_tokens]
+        embedding = self.ple_embedding.ngram_embedding
+        if self.table_on_disk:
+            rows = embedding.staged_rows(num_tokens)
+        else:
+            rows = embedding.sync_lookup(self._row_ids[:num_tokens]).flatten(-2)
+        return embedding.dequantize(rows, dtype)
 
     def short_conv(
         self,
@@ -568,6 +711,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             non_spec_token_indices = metadata.non_spec_token_indx
 
         if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
             ple_conv(
                 inputs,
                 residual,
@@ -586,6 +730,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             return
 
         state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
         if not has_prefill:
             num_decode_rows = (
                 non_spec_token_indices.numel()
@@ -644,25 +789,26 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             token_indices=tokens_p,
             **conv,
         )
+        if metadata.checkpoint is not None:
+            assert metadata.non_spec_query_start_loc is not None
+            self._checkpoint_exporter.export(
+                metadata.checkpoint,
+                raw_qkv=inputs,
+                conv_state=conv_state,
+                cu_seqlens=metadata.non_spec_query_start_loc,
+                token_indices=non_spec_token_indices,
+            )
 
-    def forward(
-        self,
-        residual: torch.Tensor,
-        input_ids: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        ngram_context: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, residual: torch.Tensor) -> torch.Tensor:
         # residual: [T, hc, n_embd] (wide state). Returns the updated wide state.
         T = residual.shape[0]
         hidden = residual.reshape(T, self.hc_dim).contiguous()
         emb = torch.empty(
             T, self.n_heads * self.head_dim, dtype=hidden.dtype, device=hidden.device
         )
-        torch.ops.vllm.qwen4_exp_xpu_ple_lookup(
-            input_ids, query_start_loc, ngram_context, emb, self.prefix
-        )
-        key = emb @ self.key_proj.weight.t()  # [T, hc_dim]
-        value = emb @ self.value_proj.weight.t()  # [T, n_embd]
+        torch.ops.vllm.qwen4_exp_xpu_ple_lookup(emb, self.prefix)
+        # key [T, hc_dim], value [T, n_embd]
+        key, value = self.kv_proj(emb).split([self.hc_dim, self.n_embd], dim=-1)
         gated, conv_input = torch.ops.vllm.qwen4_exp_xpu_ple_gate(
             key,
             value,
@@ -684,18 +830,37 @@ def _ple_layer(layer_name: str) -> Qwen4ExpPLE:
     return layer
 
 
-def qwen4_exp_xpu_ple_lookup(
+def stage_ple_rows(
+    layers: list[Qwen4ExpPLE],
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     ngram_context: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
 ) -> None:
-    # Host-side table gather: keep it out of the compiled graph.
-    layer = _ple_layer(layer_name)
-    output.copy_(layer.lookup(input_ids, query_start_loc, ngram_context))
+    """Stage one step's PLE rows behind one stream sync, before the forward.
+
+    A host read cannot be captured in a graph, so it happens here. The ids hash
+    this step's tokens, which the previous step samples on the device, and a
+    non-blocking copy from an XPU device may still be running when it returns,
+    so the read has to wait for both. A pinned table has no host read and no
+    sync: its lookup reads the hashed ids in queue order.
+    """
+    for layer in layers:
+        layer.hash_rows(input_ids, query_start_loc, ngram_context)
+    if input_ids.device.type != "cpu" and any(
+        layer.reads_rows_on_host for layer in layers
+    ):
+        with gpu_sync_allowed():
+            torch.accelerator.synchronize()
+    for layer in layers:
+        layer.stage_rows(input_ids.numel())
 
 
+def qwen4_exp_xpu_ple_lookup(output: torch.Tensor, layer_name: str) -> None:
+    # Keeps the table's rows out of the compiled graph's arguments.
+    output.copy_(_ple_layer(layer_name).lookup(output.shape[0], output.dtype))
+
+
+@eager_break_during_capture
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
@@ -771,7 +936,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.ple = None
         ple_layer_indices = {v - 1 for v in config.ple_layer_ids}
         if self.layer_idx in ple_layer_indices:
-            self.ple = Qwen4ExpPLE(config, vllm_config, prefix=f"{prefix}.ple")
+            self.ple = Qwen4ExpPLE(
+                config,
+                vllm_config,
+                prefix=f"{prefix}.ple",
+                ple_dense_layer_id=sorted(set(config.ple_layer_ids)).index(
+                    self.layer_idx + 1
+                ),
+            )
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
         self.attn_hyper_connection = HyperConnection(config, has_inject=True)
@@ -822,9 +994,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor = None,
-        input_ids: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
         **kwargs: object,
     ):
         # hidden_states: [T, n_embd] (only consumed when residual is None)
@@ -835,9 +1004,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         # PLE (n-gram table) at the configured layer, before the attention mix.
         if self.ple is not None:
-            if input_ids is None or query_start_loc is None or ngram_context is None:
-                raise RuntimeError("PLE inputs were not prepared")
-            residual = self.ple(residual, input_ids, query_start_loc, ngram_context)
+            residual = self.ple(residual)
 
         # Attention sub-block.
         cur, inject = self.attn_hyper_connection.mix(residual)
@@ -859,6 +1026,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """MoE metadata mixin for Qwen4-Exp (matches ``Qwen4ExpDecoderLayer``)."""
+
+    model: "Qwen4ExpModel"
+    num_local_physical_experts: int
 
     def update_physical_experts_metadata(
         self,
@@ -907,8 +1077,6 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
-        "query_start_loc": 0,
-        "ngram_context": 0,
     }
 )
 class Qwen4ExpModel(Qwen3NextModel):
@@ -920,6 +1088,9 @@ class Qwen4ExpModel(Qwen3NextModel):
             ".in_proj_z": (".in_proj_qkvz", 3),
             ".in_proj_b": (".in_proj_ba", 0),
             ".in_proj_a": (".in_proj_ba", 1),
+            # One GEMM for the PLE key and value projections.
+            "ple.key_proj": ("ple.kv_proj", 0),
+            "ple.value_proj": ("ple.kv_proj", 1),
         }
     )
 
@@ -1019,11 +1190,7 @@ class Qwen4ExpModel(Qwen3NextModel):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        # query_start_loc / ngram_context: per-request PLE n-gram inputs from
-        # Qwen4ExpModelState.
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1040,9 +1207,6 @@ class Qwen4ExpModel(Qwen3NextModel):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_ids=input_ids,
-                query_start_loc=query_start_loc,
-                ngram_context=ngram_context,
             )
 
         if not get_pp_group().is_last_rank:
@@ -1052,7 +1216,8 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
-        if getattr(self, "_mtp_hidden_buffer", None) is not None:
+        if self._mtp_hidden_buffer is not None:
+            assert residual is not None
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
@@ -1061,10 +1226,11 @@ class Qwen4ExpModel(Qwen3NextModel):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The PLE n-gram table is not a param: its shards (and FP8 scale) are
-        # handed to the owning Qwen4ExpPLE, which serves rows from them on
+        # A mapped PLE n-gram table is not a param: its shards (and FP8 scale)
+        # are handed to the owning Qwen4ExpPLE, which serves rows from them on
         # host and validates them in its post-load hook (this method can run
-        # several times, once per run of consecutive checkpoint names).
+        # several times, once per run of consecutive checkpoint names). The
+        # other tables load through their Qwen4ExpNGramEmbedding.
         # Indexer tensors of layers that run dense (no QSA indexer in the
         # config, or a layer type that is not indexed) are dropped and
         # reported.
@@ -1083,9 +1249,11 @@ class Qwen4ExpModel(Qwen3NextModel):
                 match = _PLE_TABLE_RE.fullmatch(name)
                 if match is not None:
                     ple = getattr(self.layers[int(match.group(1))], "ple", None)
-                    if ple is not None:
+                    if ple is None:
+                        continue
+                    if ple.table_is_mapped:
                         ple.accept_checkpoint_tensor(match.group(2), tensor)
-                    continue
+                        continue
                 yield name, tensor
 
         loader = AutoWeightsLoader(self)
@@ -1122,6 +1290,7 @@ class Qwen4ExpForCausalLM(
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "kv_proj": ["key_proj", "value_proj"],
         # GDN fused projections (separate in the checkpoint).
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
@@ -1179,8 +1348,6 @@ class Qwen4ExpForCausalLM(
             positions,
             intermediate_tensors,
             inputs_embeds,
-            query_start_loc=kwargs.get("query_start_loc"),
-            ngram_context=kwargs.get("ngram_context"),
         )
         return hidden_states
 
@@ -1350,6 +1517,9 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
     model is nested under ``language_model``).
     """
 
+    language_model: "Qwen4ExpForCausalLM"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1412,9 +1582,10 @@ class Qwen4ExpForConditionalGeneration(
     """
 
     supports_multimodal_pruning = True
-    is_3d_moe_weight: bool = True
+    is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
+        "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
@@ -1425,6 +1596,10 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError(
+                "Qwen4ExpForConditionalGeneration requires multimodal_config"
+            )
 
         self.config = config
         self.model_config = vllm_config.model_config
@@ -1488,8 +1663,6 @@ class Qwen4ExpForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            query_start_loc=kwargs.get("query_start_loc"),
-            ngram_context=kwargs.get("ngram_context"),
         )
         return hidden_states
 
