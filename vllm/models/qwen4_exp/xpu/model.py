@@ -39,6 +39,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -81,6 +82,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     WeightsMapper,
     extract_layer_index,
     make_layers,
@@ -1399,6 +1401,7 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
 )
 class Qwen4ExpForConditionalGeneration(
     Qwen3VLForConditionalGeneration,
+    HasInnerState,
     IsHybrid,
     Qwen4ExpMoeMixtureOfExperts,
 ):
@@ -1429,32 +1432,45 @@ class Qwen4ExpForConditionalGeneration(
         self.config = config
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        self._init_video_pruning(multimodal_config)
-        self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+        self.language_model_only = multimodal_config.language_model_only
 
-        # Deepstack is unused by this checkpoint (``deepstack_visual_indexes``
-        # is empty); guard on a non-empty list so the deepstack code paths are
-        # skipped.
-        self.use_deepstack = (
-            hasattr(config.vision_config, "deepstack_visual_indexes")
-            and len(config.vision_config.deepstack_visual_indexes) > 0
+        # The forward feeds no deepstack embeddings to the text model, so a
+        # checkpoint that names deepstack layers would run without them.
+        deepstack_indexes = getattr(
+            config.vision_config, "deepstack_visual_indexes", []
         )
-        self.deepstack_num_level = (
-            len(config.vision_config.deepstack_visual_indexes)
-            if self.use_deepstack
-            else 0
-        )
-        self.visual_dim = config.vision_config.out_hidden_size
-        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
-
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
+        if deepstack_indexes and not self.language_model_only:
+            raise NotImplementedError(
+                "The XPU Qwen4Exp vision tower does not feed deepstack embeddings "
+                f"(deepstack_visual_indexes={list(deepstack_indexes)}); serve it "
+                "with --language-model-only, or on CUDA/ROCm."
             )
+        self.use_deepstack = False
+        self.deepstack_num_level = 0
+        self.visual_dim = config.vision_config.out_hidden_size
+        self.multiscale_dim = 0
+
+        if self.language_model_only:
+            # Text only: no vision tower, and its checkpoint weights are dropped.
+            self.use_data_parallel = False
+            self.is_multimodal_pruning_enabled = False
+            self.video_pruning_method = None
+            self.video_pruning_rate = 0.0
+            self._tokenizer = None
+            self.visual = StageMissingLayer("vision_tower")
+            self._tower_model_names = []
+        else:
+            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+            self._init_video_pruning(multimodal_config)
+            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    input_norm=build_mm_input_norm(self.model_config),
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen4ExpForCausalLM(
@@ -1513,12 +1529,15 @@ class Qwen4ExpForConditionalGeneration(
         # text model (``model.language_model.*`` -> ``language_model.model.*``)
         # via the inherited Qwen3-VL weight mapper. Skip the MTP drafter head
         # (``mtp.*``); PLE table shards and QSA indexer tensors are handled by
-        # ``Qwen4ExpModel.load_weights``.
+        # ``Qwen4ExpModel.load_weights``. Text only drops the vision tower.
+        mapper = self.hf_to_vllm_mapper
+        if self.language_model_only:
+            mapper = mapper | WeightsMapper(orig_to_new_prefix={"visual.": None})
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=["mtp."],
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
