@@ -59,6 +59,13 @@ def _maybe_dequant(tile):
 
 
 @lru_cache(maxsize=1)
+def fp8_kv_view_is_native() -> bool:
+    """True where Triton loads the FP8 cache as e4m3 (sm_89+, Intel XPU); elsewhere
+    the kernels byte-decode the raw uint8 storage with PTX."""
+    return current_platform.is_xpu() or current_platform.has_device_capability(89)
+
+
+@lru_cache(maxsize=1)
 def _is_sm80() -> bool:
     """True on sm_80 (A100/A30): selects the wide FP8 byte-decode tiles."""
     return current_platform.get_device_capability() == (8, 0)
@@ -720,6 +727,23 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
+    if current_platform.is_xpu():
+        from ...xpu.ops.qsa_attn2 import qsa_sparse_paged_attention_attn2
+
+        return qsa_sparse_paged_attention_attn2(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            output_gate_view,
+            softmax_scale,
+            output_scale,
+            block_m,
+        )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
@@ -816,16 +840,21 @@ def warmup_qsa_sparse_paged_attention(
     selection_width: int,
 ) -> tuple[tuple[int, int, int], ...]:
     """Compile every production-reachable split-K/merge specialization."""
+    if current_platform.is_xpu():
+        from ...xpu.ops.qsa_attn2 import warmup_qsa_sparse_paged_attention_attn2
+
+        return warmup_qsa_sparse_paged_attention_attn2(
+            kv_cache,
+            block_table,
+            num_query_heads=num_query_heads,
+            selection_width=selection_width,
+        )
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     # An fp8 cache is allocated as uint8 storage; warm the dtype the impl hands
-    # over: an e4m3 view on sm_89+, the raw bytes below.
+    # over: an e4m3 view where it is native, the raw bytes elsewhere.
     is_fp8 = kv_cache.dtype == torch.uint8
-    fp8_dtype = (
-        torch.float8_e4m3fn
-        if current_platform.has_device_capability(89)
-        else torch.uint8
-    )
+    fp8_dtype = torch.float8_e4m3fn if fp8_kv_view_is_native() else torch.uint8
     cache_dtype = fp8_dtype if is_fp8 else key_cache.dtype
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
@@ -963,8 +992,8 @@ def qsa_store_cache_rows(
     rows: torch.Tensor,
 ) -> None:
     """Store fixed-width rows in a QSA cache without boolean indexing."""
-    if not cache.is_cuda or not HAS_TRITON:
-        raise RuntimeError("QSA CUDA cache stores require Triton")
+    if cache.device.type not in ("cuda", "xpu") or not HAS_TRITON:
+        raise RuntimeError("QSA cache stores require a CUDA or XPU device and Triton")
     if cache.ndim != 4 or cache.shape[2] != 1:
         raise ValueError("QSA cache must be [pages, page_size, 1, width]")
     if not all(cache.shape):
@@ -1008,8 +1037,8 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
-    if not raw_keys.is_cuda or not HAS_TRITON:
-        raise RuntimeError("QSA CUDA compression requires Triton")
+    if raw_keys.device.type not in ("cuda", "xpu") or not HAS_TRITON:
+        raise RuntimeError("QSA compression requires a CUDA or XPU device and Triton")
     rows = token_to_req.numel()
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")

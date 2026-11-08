@@ -21,10 +21,11 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from itertools import islice
+from typing import ClassVar
 
+import regex as re
 import torch
 from torch import nn
 from transformers import (
@@ -154,14 +155,18 @@ def _is_file_backed(tensor: torch.Tensor) -> bool | None:
 def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
     """Report (once) that checkpoint QSA indexer weights are ignored.
 
-    QSA attends to at most ``indexer_budget`` selected tokens, so dense
-    attention is expected to match it only while a sequence fits the budget.
+    The indexed layers run QSA when the config names an indexer
+    (``indexer_n_heads``). Without one they run dense attention, and the
+    checkpoint's indexer tensors have no owner. QSA attends to at most
+    ``indexer_budget`` selected tokens, so dense attention is expected to match
+    it only while a sequence fits the budget.
     """
     budget = getattr(config, "indexer_budget", None)
     if budget is not None and max_model_len > budget:
         logger.warning_once(
-            "The checkpoint ships QSA indexer weights, but the XPU backend runs "
-            "dense attention and ignores them. Dense attention is only expected "
+            "The checkpoint ships QSA indexer weights, but the config sets no "
+            "indexer (indexer_n_heads), so the indexed layers run dense attention "
+            "and ignore them. Dense attention is only expected "
             "to match the sparse model while a sequence fits the indexer budget "
             "(%d tokens); with max_model_len=%d, longer sequences attend to every "
             "token and may diverge from the reference. Use --max-model-len %d to "
@@ -172,9 +177,9 @@ def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
         )
     else:
         logger.info_once(
-            "Ignoring the checkpoint's QSA indexer weights: the XPU backend runs "
-            "dense attention, expected to match QSA within max_model_len=%d "
-            "(indexer budget %s).",
+            "Ignoring the checkpoint's QSA indexer weights: the config sets no "
+            "indexer (indexer_n_heads), so the indexed layers run dense attention, "
+            "expected to match QSA within max_model_len=%d (indexer budget %s).",
             max_model_len,
             budget,
         )
@@ -189,7 +194,7 @@ class _WeightContainer(nn.Module):
     sits at the exact ``<name>.weight`` path the checkpoint expects.
     """
 
-    def __init__(self, shape: tuple[int, ...]):
+    def __init__(self, shape: Sequence[int]):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(*shape))
 
@@ -488,6 +493,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         if self._shard_starts is None and self._dummy_load:
             return torch.zeros(rows.numel(), self.head_dim, dtype=torch.bfloat16)
         starts = self._shard_starts
+        assert starts is not None
         if rows.numel() and int(rows.min()) < 0:
             raise IndexError("PLE row id must be non-negative")
         shard = torch.searchsorted(starts, rows, right=True) - 1
@@ -504,6 +510,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         emb = out.view(self._ckpt_dtype)
         if self._ckpt_dtype == torch.float8_e4m3fn:
             # Same dequantization as the CUDA/ROCm FP8 PLE embedding.
+            assert self._ckpt_scale is not None
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
@@ -568,6 +575,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             non_spec_token_indices = metadata.non_spec_token_indx
 
         if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
             ple_conv(
                 inputs,
                 residual,
@@ -586,6 +594,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             return
 
         state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
         if not has_prefill:
             num_decode_rows = (
                 non_spec_token_indices.numel()
@@ -860,6 +869,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """MoE metadata mixin for Qwen4-Exp (matches ``Qwen4ExpDecoderLayer``)."""
 
+    model: "Qwen4ExpModel"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1052,7 +1064,8 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
-        if getattr(self, "_mtp_hidden_buffer", None) is not None:
+        if self._mtp_hidden_buffer is not None:
+            assert residual is not None
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
@@ -1126,6 +1139,8 @@ class Qwen4ExpForCausalLM(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+
+    requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -1350,6 +1365,9 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
     model is nested under ``language_model``).
     """
 
+    language_model: "Qwen4ExpForCausalLM"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1411,8 +1429,9 @@ class Qwen4ExpForConditionalGeneration(
     processor, and MRoPE wiring are reused verbatim.
     """
 
+    requires_raw_input_tokens = True
     supports_multimodal_pruning = True
-    is_3d_moe_weight: bool = True
+    is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -1425,6 +1444,10 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError(
+                "Qwen4ExpForConditionalGeneration requires multimodal_config"
+            )
 
         self.config = config
         self.model_config = vllm_config.model_config
