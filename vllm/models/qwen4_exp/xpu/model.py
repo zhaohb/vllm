@@ -9,8 +9,9 @@ full-attention + MoE) extended with:
   RMSNorm + residual add. The state between blocks is ``hc`` parallel
   residual streams ``[T, hc, n_embd]``; each sub-block reads one mixed
   ``[T, n_embd]`` view and writes back through per-stream injection
-  weights. The top-level ``hyper_connection_mixer`` acts as the final
-  output norm (there is no separate RMSNorm).
+  weights, delayed to the next mix so the two fuse. The top-level
+  ``hyper_connection_mixer`` acts as the final output norm (there is no
+  separate RMSNorm).
 - **PLE** n-gram embedding table, served on host from the checkpoint shards
   (see ``Qwen4ExpPLE``).
 - **QSA** sparse attention on the indexed layers, via the CUDA
@@ -21,10 +22,11 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-import re
 from collections.abc import Iterable
 from itertools import islice
+from typing import ClassVar
 
+import regex as re
 import torch
 from torch import nn
 from transformers import (
@@ -104,6 +106,7 @@ from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
 from ..nvidia.model import get_qsa_topk_buffer_width
 from ..nvidia.qsa import Qwen4ExpQSAAttention
+from .hyperconnection import HyperConnection, _WeightContainer
 
 logger = init_logger(__name__)
 
@@ -178,99 +181,6 @@ def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
             max_model_len,
             budget,
         )
-
-
-class _WeightContainer(nn.Module):
-    """Holds a single ``weight`` parameter (no bias, no forward).
-
-    Used for the hyper-connection weights, which are plain BF16 tensors
-    (excluded from quantization via ``re:.*hyper_connection.*``) loaded
-    directly from the checkpoint. The container exists only so the weight
-    sits at the exact ``<name>.weight`` path the checkpoint expects.
-    """
-
-    def __init__(self, shape: tuple[int, ...]):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(*shape))
-
-
-class HyperConnection(nn.Module):
-    """Hyper-connection mix/combine block.
-
-    Replaces the standard per-layer RMSNorm + residual add. The state
-    between blocks is ``hc`` parallel residual streams ``[T, hc, n_embd]``.
-
-    ``mix`` reads one mixed ``[T, n_embd]`` view:
-        grouped-RMSNorm (per stream) -> gamma (``hc_norm``) ->
-        low-rank down -> ``silu(x / hc)`` -> up -> sigmoid gate ->
-        ``x * gate`` -> mean-collapse the streams.
-    It optionally returns ``[T, hc]`` scatter weights (``inject``).
-
-    ``combine`` writes a block output back into the wide state:
-        ``residual + block_out * 2 * sigmoid(inject / hc)``.
-    The ``2 * sigmoid`` centres the scatter weights on 1, so an
-    untrained injection matrix reproduces the plain residual add.
-
-    ``has_inject=False`` is used for the top-level ``hyper_connection_mixer``
-    (the final output norm), which has no ``block_inject_weight``.
-    """
-
-    def __init__(self, config: Qwen4ExpTextConfig, has_inject: bool = True):
-        super().__init__()
-        self.hc = config.hc_count
-        self.n_embd = config.hidden_size
-        self.hc_dim = self.hc * self.n_embd
-        self.lowrank = config.hc_lowrank
-        self.eps = config.rms_norm_eps
-        self.has_inject = has_inject
-
-        self.hc_norm = _WeightContainer([self.hc_dim])
-        self.input_mix_weight_down = _WeightContainer([self.lowrank, self.hc_dim])
-        self.input_mix_weight_up = _WeightContainer([self.hc_dim, self.lowrank])
-        if has_inject:
-            self.block_inject_weight = _WeightContainer([self.hc, self.hc_dim])
-
-    def _grouped_rms_norm(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [T, hc, n_embd]; normalize each [n_embd] stream independently
-        # (reduces over the last dim), matching ggml_rms_norm over ne[0].
-        var = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps).to(x.dtype)
-
-    def mix(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # x: [T, hc, n_embd]
-        xn = self._grouped_rms_norm(x)
-        xn_flat = xn.reshape(xn.shape[0], self.hc_dim)
-        # The checkpoint stores the gamma DEVIATION w (mean ~ -0.06); the true
-        # RMSNorm gamma is (1 + w). llama.cpp folds this in the GGUF converter
-        # ("Gammas were folded to (1 + w) by the converter"), so it uses 1 + w.
-        # Compute in fp32 to avoid bf16 precision loss adding 1.0 to small w.
-        gamma = (1.0 + self.hc_norm.weight.float()).to(xn_flat.dtype)
-        xn_flat = xn_flat * gamma
-        lo = torch.nn.functional.linear(xn_flat, self.input_mix_weight_down.weight)
-        lo = torch.nn.functional.silu(lo / self.hc)
-        gate = torch.sigmoid(
-            torch.nn.functional.linear(lo, self.input_mix_weight_up.weight)
-        )
-        gated = (xn_flat * gate).reshape(xn.shape[0], self.hc, self.n_embd)
-        mixed = gated.mean(dim=1)  # collapse streams by their mean -> [T, n_embd]
-        inject = None
-        if self.has_inject:
-            inject = torch.nn.functional.linear(
-                xn_flat, self.block_inject_weight.weight
-            )  # [T, hc]
-        return mixed, inject
-
-    def combine(
-        self,
-        residual: torch.Tensor,
-        block_out: torch.Tensor,
-        inject: torch.Tensor,
-    ) -> torch.Tensor:
-        # residual: [T, hc, n_embd]; block_out: [T, n_embd]; inject: [T, hc]
-        w = 2.0 * torch.sigmoid(inject / self.hc)  # [T, hc]
-        w = w.unsqueeze(-1)  # [T, hc, 1]
-        b = block_out.unsqueeze(1)  # [T, 1, n_embd]
-        return residual + b * w
 
 
 class PLEEmbedding(nn.Module):
@@ -488,6 +398,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         if self._shard_starts is None and self._dummy_load:
             return torch.zeros(rows.numel(), self.head_dim, dtype=torch.bfloat16)
         starts = self._shard_starts
+        assert starts is not None
         if rows.numel() and int(rows.min()) < 0:
             raise IndexError("PLE row id must be non-negative")
         shard = torch.searchsorted(starts, rows, right=True) - 1
@@ -504,6 +415,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         emb = out.view(self._ckpt_dtype)
         if self._ckpt_dtype == torch.float8_e4m3fn:
             # Same dequantization as the CUDA/ROCm FP8 PLE embedding.
+            assert self._ckpt_scale is not None
             emb = emb.to(torch.bfloat16) * self._ckpt_scale.to(torch.bfloat16)
         return emb
 
@@ -568,6 +480,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             non_spec_token_indices = metadata.non_spec_token_indx
 
         if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
             ple_conv(
                 inputs,
                 residual,
@@ -586,6 +499,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             return
 
         state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
         if not has_prefill:
             num_decode_rows = (
                 non_spec_token_indices.numel()
@@ -774,8 +688,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             self.ple = Qwen4ExpPLE(config, vllm_config, prefix=f"{prefix}.ple")
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
-        self.attn_hyper_connection = HyperConnection(config, has_inject=True)
-        self.mlp_hyper_connection = HyperConnection(config, has_inject=True)
+        self.attn_hyper_connection = HyperConnection(
+            config, has_inject=True, prefix=f"{prefix}.attn_hyper_connection"
+        )
+        self.mlp_hyper_connection = HyperConnection(
+            config, has_inject=True, prefix=f"{prefix}.mlp_hyper_connection"
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -825,10 +743,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
+        block_output: torch.Tensor | None = None,
+        injection: torch.Tensor | None = None,
         **kwargs: object,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # hidden_states: [T, n_embd] (only consumed when residual is None)
         # residual: [T, hc, n_embd] (the wide hyper-connection state)
+        # block_output, injection: the previous layer's combine, still pending
         if residual is None:
             # First layer: broadcast the embedding to `hc` identical streams.
             residual = hidden_states.unsqueeze(1).expand(-1, self.hc, -1).contiguous()
@@ -837,28 +758,41 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.ple is not None:
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
+            # PLE adds to the wide state, so a pending combine lands first.
+            if block_output is not None:
+                residual = self.attn_hyper_connection.combine(
+                    residual, block_output, injection
+                )
+                block_output = None
             residual = self.ple(residual, input_ids, query_start_loc, ngram_context)
 
         # Attention sub-block.
-        cur, inject = self.attn_hyper_connection.mix(residual)
+        if block_output is None:
+            cur, inject = self.attn_hyper_connection.mix(residual)
+        else:
+            residual, cur, inject = self.attn_hyper_connection.combine_and_mix(
+                residual, block_output, injection
+            )
         if self.layer_type == "linear_attention":
             cur = self.linear_attn(hidden_states=cur)
         else:
             cur = self.self_attn(hidden_states=cur, positions=positions)
-        residual = self.attn_hyper_connection.combine(residual, cur, inject)
 
         # MLP sub-block.
-        cur, inject = self.mlp_hyper_connection.mix(residual)
+        residual, cur, inject = self.mlp_hyper_connection.combine_and_mix(
+            residual, cur, inject
+        )
         cur = self.mlp(cur)
-        residual = self.mlp_hyper_connection.combine(residual, cur, inject)
 
-        # Return the mean-collapsed view (only used if the next layer has
-        # residual=None) + the wide state.
-        return residual.mean(dim=1), residual
+        # The wide state, and this layer's combine for the next mix to apply.
+        return residual, cur, inject
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """MoE metadata mixin for Qwen4-Exp (matches ``Qwen4ExpDecoderLayer``)."""
+
+    model: "Qwen4ExpModel"
+    num_local_physical_experts: int
 
     def update_physical_experts_metadata(
         self,
@@ -920,6 +854,15 @@ class Qwen4ExpModel(Qwen3NextModel):
             ".in_proj_z": (".in_proj_qkvz", 3),
             ".in_proj_b": (".in_proj_ba", 0),
             ".in_proj_a": (".in_proj_ba", 1),
+            # One GEMM for the down and injection projections of a block's HC.
+            "hyper_connection.input_mix_weight_down.weight": (
+                "hyper_connection.input_mix_weight_down_block_inject.weight",
+                0,
+            ),
+            "hyper_connection.block_inject_weight.weight": (
+                "hyper_connection.input_mix_weight_down_block_inject.weight",
+                1,
+            ),
         }
     )
 
@@ -986,7 +929,9 @@ class Qwen4ExpModel(Qwen3NextModel):
         # The top-level hyper-connection mixer acts as the final output norm
         # (there is no separate RMSNorm).
         if get_pp_group().is_last_rank:
-            self.hyper_connection_mixer = HyperConnection(config, has_inject=False)
+            self.hyper_connection_mixer = HyperConnection(
+                config, has_inject=False, prefix=f"{prefix}.hyper_connection_mixer"
+            )
         else:
             self.hyper_connection_mixer = PPMissingLayer()
 
@@ -1035,29 +980,40 @@ class Qwen4ExpModel(Qwen3NextModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        block_output = injection = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(
+            residual, block_output, injection = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                block_output=block_output,
+                injection=injection,
             )
 
         if not get_pp_group().is_last_rank:
+            # PP carries the wide state, not a pending combine.
+            residual = layer.mlp_hyper_connection.combine(
+                residual, block_output, injection
+            )
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        # Final output norm = the top-level hyper-connection mixer, which applies
+        # the last combine.
+        residual, hidden_states, _ = self.hyper_connection_mixer.combine_and_mix(
+            residual, block_output, injection
+        )
+
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
-        if getattr(self, "_mtp_hidden_buffer", None) is not None:
+        if self._mtp_hidden_buffer is not None:
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
-        # Final output norm = the top-level hyper-connection mixer.
-        hidden_states, _ = self.hyper_connection_mixer.mix(residual)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1350,6 +1306,9 @@ class Qwen4ExpMoeMixtureOfExperts(MixtureOfExperts):
     model is nested under ``language_model``).
     """
 
+    language_model: "Qwen4ExpForCausalLM"
+    num_local_physical_experts: int
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -1412,7 +1371,7 @@ class Qwen4ExpForConditionalGeneration(
     """
 
     supports_multimodal_pruning = True
-    is_3d_moe_weight: bool = True
+    is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -1425,6 +1384,10 @@ class Qwen4ExpForConditionalGeneration(
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError(
+                "Qwen4ExpForConditionalGeneration requires multimodal_config"
+            )
 
         self.config = config
         self.model_config = vllm_config.model_config
