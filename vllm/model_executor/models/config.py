@@ -1291,6 +1291,20 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise NotImplementedError(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
+        if (
+            current_platform.is_xpu()
+            and text_config.ple_layer_ids
+            and not vllm_config.use_v2_model_runner
+        ):
+            # The XPU PLE rows are staged by the V2 model state before each
+            # step. The V1 runner never calls it, so the forward would read
+            # rows that were never staged.
+            raise NotImplementedError(
+                "Qwen4Exp PLE on XPU runs only on Model Runner V2, which stages "
+                "the PLE rows before each step. Set VLLM_USE_V2_MODEL_RUNNER=1; "
+                "if it was unset, the warning above names the features that "
+                "selected the V1 runner."
+            )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
